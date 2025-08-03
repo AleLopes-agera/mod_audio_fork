@@ -33,16 +33,9 @@ The build script will automatically install these, but you can install them manu
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-    build-essential \
     cmake \
-    pkg-config \
     libwebsockets-dev \
-    libspeex-dev \
-    libboost-all-dev \
-    libssl-dev \
-    libevent-dev \
-    libjson-c-dev \
-    libcurl4-openssl-dev
+    libboost-all-dev
 ```
 
 ## Building the Module

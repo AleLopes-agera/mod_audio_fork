@@ -268,7 +268,8 @@ namespace {
               switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) STREAM DEBUG: Payload Size: %zu | Writing frames...\n", tech_pvt->id, decodedLen);
 
               while (offset + bytes_per_frame <= decodedLen) {
-                switch_frame_t frame = { 0 };
+                switch_frame_t frame;
+                memset(&frame, 0, sizeof(frame));
                 frame.codec = &tech_pvt->raw_write_codec;
                 frame.data = data + offset;
                 frame.datalen = bytes_per_frame;
@@ -874,7 +875,8 @@ extern "C" {
       pAudioPipe->lockAudioBuffer();
       size_t available = pAudioPipe->binarySpaceAvailable();
       if (NULL == tech_pvt->resampler) {
-        switch_frame_t frame = { 0 };
+        switch_frame_t frame;
+        memset(&frame, 0, sizeof(frame));
         frame.data = pAudioPipe->binaryWritePtr();
         frame.buflen = available;
         while (true) {
@@ -905,7 +907,8 @@ extern "C" {
       }
       else {
         uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
-        switch_frame_t frame = { 0 };
+        switch_frame_t frame;
+        memset(&frame, 0, sizeof(frame));
         frame.data = data;
         frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
         while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {

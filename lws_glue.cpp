@@ -214,74 +214,84 @@ namespace {
         tech_pvt->bidirectional_audio_enable &&
         !tech_pvt->bidirectional_audio_stream) {
         if (jsonData) {
-          // dont send actual audio bytes in event message
-          cJSON* jsonFile = NULL;
           cJSON* jsonAudio = cJSON_DetachItemFromObject(jsonData, "audioContent");
           int validAudio = (jsonAudio && NULL != jsonAudio->valuestring);
-
           const char* szAudioContentType = cJSON_GetObjectCstr(jsonData, "audioContentType");
-          char fileType[6];
-          int sampleRate = 16000;
-          if (0 == strcmp(szAudioContentType, "raw")) {
-            cJSON* jsonSR = cJSON_GetObjectItem(jsonData, "sampleRate");
-            sampleRate = jsonSR && jsonSR->valueint ? jsonSR->valueint : 0;
 
-            switch(sampleRate) {
-              case 8000:
-                strcpy(fileType, ".r8");
-                break;
-              case 16000:
-                strcpy(fileType, ".r16");
-                break;
-              case 24000:
-                strcpy(fileType, ".r24");
-                break;
-              case 32000:
-                strcpy(fileType, ".r32");
-                break;
-              case 48000:
-                strcpy(fileType, ".r48");
-                break;
-              case 64000:
-                strcpy(fileType, ".r64");
-                break;
-              default:
-                strcpy(fileType, ".r16");
-                break;
-            }
+          if (!validAudio) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%u) processIncomingMessage - missing audioContent in playAudio request\n", tech_pvt->id);
           }
-          else if (0 == strcmp(szAudioContentType, "wave") || 0 == strcmp(szAudioContentType, "wav")) {
-            strcpy(fileType, ".wav");
+          else if (0 != strcmp(szAudioContentType, "raw")) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "(%u) processIncomingMessage - unsupported audioContentType: %s. Real-time streaming requires raw format.\n", tech_pvt->id, szAudioContentType);
           }
           else {
-            validAudio = 0;
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "(%u) processIncomingMessage - unsupported audioContentType: %s\n", tech_pvt->id, szAudioContentType);
-          }
-
-          if (validAudio) {
-            char szFilePath[256];
-
+            // Decode Base64
             std::string rawAudio = drachtio::base64_decode(jsonAudio->valuestring);
-            switch_snprintf(szFilePath, 256, "%s%s%s_%d.tmp%s", SWITCH_GLOBAL_dirs.temp_dir, 
-              SWITCH_PATH_SEPARATOR, tech_pvt->sessionId, playCount++, fileType);
-            std::ofstream f(szFilePath, std::ofstream::binary);
-            f << rawAudio;
-            f.close();
+            size_t decodedLen = rawAudio.length();
+            uint8_t *data = (uint8_t *) rawAudio.data();
 
-            // add the file to the list of files played for this session, we'll delete when session closes
-            struct playout* playout = (struct playout *) malloc(sizeof(struct playout));
-            playout->file = (char *) malloc(strlen(szFilePath) + 1);
-            strcpy(playout->file, szFilePath);
-            playout->next = tech_pvt->playout;
-            tech_pvt->playout = playout;
+            // Get Sample Rate
+            int sampleRate = 8000;
+            cJSON* jsonSR = cJSON_GetObjectItem(jsonData, "sampleRate");
+            if (jsonSR && jsonSR->valueint) sampleRate = jsonSR->valueint;
 
-            jsonFile = cJSON_CreateString(szFilePath);
-            cJSON_AddItemToObject(jsonData, "file", jsonFile);
+            // Lock for Codec Initialization and Writing
+            if (switch_mutex_lock(session->codec_write_mutex) == SWITCH_STATUS_SUCCESS) {
+              // Initialize Codec if needed
+              if (!tech_pvt->raw_write_codec_initialized) {
+                if (switch_core_codec_init(&tech_pvt->raw_write_codec,
+                              "L16",
+                              NULL,
+                              NULL,
+                              sampleRate,
+                              20,
+                              1,
+                              SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE,
+                              NULL, switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
+                  tech_pvt->raw_write_codec_initialized = 1;
+                  switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) Raw write codec initialized at %dHz\n", tech_pvt->id, sampleRate);
+                } else {
+                  switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) Failed to initialize raw write codec\n", tech_pvt->id);
+                  switch_mutex_unlock(session->codec_write_mutex);
+                  if (jsonAudio) cJSON_Delete(jsonAudio);
+                  return; // Stop processing
+                }
+              }
+
+              // Chunking and Writing
+              int channels = 1;
+              int frame_duration_ms = 20;
+              int bytes_per_frame = (sampleRate * frame_duration_ms / 1000) * 2 * channels; // 16-bit = 2 bytes
+              size_t offset = 0;
+
+              // Log first frame only
+              switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) STREAM DEBUG: Payload Size: %zu | Writing frames...\n", tech_pvt->id, decodedLen);
+
+              while (offset + bytes_per_frame <= decodedLen) {
+                switch_frame_t frame = { 0 };
+                frame.codec = &tech_pvt->raw_write_codec;
+                frame.data = data + offset;
+                frame.datalen = bytes_per_frame;
+                frame.samples = bytes_per_frame / 2; // 16-bit samples
+                frame.rate = sampleRate;
+                frame.channels = channels;
+                frame.timestamp = tech_pvt->write_ts;
+                tech_pvt->write_ts += frame.samples;
+
+                switch_status_t status = switch_core_session_write_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0);
+
+                if (status != SWITCH_STATUS_SUCCESS) {
+                  switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) STREAM ERROR: Write Frame failed! Status: %d\n", tech_pvt->id, status);
+                  break;
+                }
+
+                offset += bytes_per_frame;
+              }
+              switch_mutex_unlock(session->codec_write_mutex);
+            } else {
+              switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) Failed to lock codec_write_mutex\n", tech_pvt->id);
+            }
           }
-
-          char* jsonString = cJSON_PrintUnformatted(jsonData);
-          tech_pvt->responseHandler(session, EVENT_PLAY_AUDIO, jsonString);
-          free(jsonString);
           if (jsonAudio) cJSON_Delete(jsonAudio);
         }
         else {
@@ -480,6 +490,8 @@ namespace {
     tech_pvt->clear_bidirectional_audio_buffer = false;
     tech_pvt->has_set_aside_byte = 0;
     tech_pvt->downscale_factor = 1;
+    tech_pvt->raw_write_codec_initialized = 0;
+    tech_pvt->write_ts = 0;
     if (bidirectional_audio_sample_rate > sampling) {
       tech_pvt->downscale_factor = bidirectional_audio_sample_rate / sampling;
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "downscale_factor is %d\n", tech_pvt->downscale_factor);
@@ -541,6 +553,10 @@ namespace {
     if (tech_pvt->bidirectional_audio_resampler) {
       speex_resampler_destroy(tech_pvt->bidirectional_audio_resampler);
       tech_pvt->bidirectional_audio_resampler = nullptr;
+    }
+    if (tech_pvt->raw_write_codec_initialized) {
+      switch_core_codec_destroy(&tech_pvt->raw_write_codec);
+      tech_pvt->raw_write_codec_initialized = 0;
     }
     if (tech_pvt->mutex) {
       switch_mutex_destroy(tech_pvt->mutex);

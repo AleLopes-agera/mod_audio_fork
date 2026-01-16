@@ -70,6 +70,10 @@ struct private_data {
 	int bidirectional_audio_stream;
   int bidirectional_audio_sample_rate;
   int clear_bidirectional_audio_buffer;
+
+  switch_codec_t raw_write_codec;
+  int raw_write_codec_initialized;
+  uint32_t write_ts;
 };
 
 typedef struct private_data private_t;

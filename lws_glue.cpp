@@ -235,62 +235,58 @@ namespace {
             cJSON* jsonSR = cJSON_GetObjectItem(jsonData, "sampleRate");
             if (jsonSR && jsonSR->valueint) sampleRate = jsonSR->valueint;
 
-            // Lock for Codec Initialization and Writing
-            if (switch_mutex_lock(session->codec_write_mutex) == SWITCH_STATUS_SUCCESS) {
-              // Initialize Codec if needed
-              if (!tech_pvt->raw_write_codec_initialized) {
-                if (switch_core_codec_init(&tech_pvt->raw_write_codec,
-                              "L16",
-                              NULL,
-                              NULL,
-                              sampleRate,
-                              20,
-                              1,
-                              SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE,
-                              NULL, switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
-                  tech_pvt->raw_write_codec_initialized = 1;
-                  switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) Raw write codec initialized at %dHz\n", tech_pvt->id, sampleRate);
-                } else {
-                  switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) Failed to initialize raw write codec\n", tech_pvt->id);
-                  switch_mutex_unlock(session->codec_write_mutex);
-                  if (jsonAudio) cJSON_Delete(jsonAudio);
-                  return; // Stop processing
-                }
+            // Initialize Codec if needed
+            // Use a scoped lock for the tech_pvt->mutex to protect shared state like codec initialization if needed.
+            // However, raw_write_codec is per-session and this callback is sequential per session usually.
+            if (!tech_pvt->raw_write_codec_initialized) {
+              if (switch_core_codec_init(&tech_pvt->raw_write_codec,
+                            "L16",
+                            NULL,
+                            NULL,
+                            sampleRate,
+                            20,
+                            1,
+                            SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE,
+                            NULL, switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
+                tech_pvt->raw_write_codec_initialized = 1;
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) Raw write codec initialized at %dHz\n", tech_pvt->id, sampleRate);
+              } else {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) Failed to initialize raw write codec\n", tech_pvt->id);
+                if (jsonAudio) cJSON_Delete(jsonAudio);
+                return; // Stop processing
+              }
+            }
+
+            // Chunking and Writing
+            int channels = 1;
+            int frame_duration_ms = 20;
+            int bytes_per_frame = (sampleRate * frame_duration_ms / 1000) * 2 * channels; // 16-bit = 2 bytes
+            size_t offset = 0;
+
+            // Log first frame only
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) STREAM DEBUG: Payload Size: %zu | Writing frames...\n", tech_pvt->id, decodedLen);
+
+            while (offset + bytes_per_frame <= decodedLen) {
+              switch_frame_t frame;
+              memset(&frame, 0, sizeof(frame));
+              frame.codec = &tech_pvt->raw_write_codec;
+              frame.data = data + offset;
+              frame.datalen = bytes_per_frame;
+              frame.samples = bytes_per_frame / 2; // 16-bit samples
+              frame.rate = sampleRate;
+              frame.channels = channels;
+              frame.timestamp = tech_pvt->write_ts;
+              tech_pvt->write_ts += frame.samples;
+
+              // switch_core_session_write_frame handles internal locking of the write queue/codec
+              switch_status_t status = switch_core_session_write_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0);
+
+              if (status != SWITCH_STATUS_SUCCESS) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) STREAM ERROR: Write Frame failed! Status: %d\n", tech_pvt->id, status);
+                break;
               }
 
-              // Chunking and Writing
-              int channels = 1;
-              int frame_duration_ms = 20;
-              int bytes_per_frame = (sampleRate * frame_duration_ms / 1000) * 2 * channels; // 16-bit = 2 bytes
-              size_t offset = 0;
-
-              // Log first frame only
-              switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) STREAM DEBUG: Payload Size: %zu | Writing frames...\n", tech_pvt->id, decodedLen);
-
-              while (offset + bytes_per_frame <= decodedLen) {
-                switch_frame_t frame;
-                memset(&frame, 0, sizeof(frame));
-                frame.codec = &tech_pvt->raw_write_codec;
-                frame.data = data + offset;
-                frame.datalen = bytes_per_frame;
-                frame.samples = bytes_per_frame / 2; // 16-bit samples
-                frame.rate = sampleRate;
-                frame.channels = channels;
-                frame.timestamp = tech_pvt->write_ts;
-                tech_pvt->write_ts += frame.samples;
-
-                switch_status_t status = switch_core_session_write_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0);
-
-                if (status != SWITCH_STATUS_SUCCESS) {
-                  switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) STREAM ERROR: Write Frame failed! Status: %d\n", tech_pvt->id, status);
-                  break;
-                }
-
-                offset += bytes_per_frame;
-              }
-              switch_mutex_unlock(session->codec_write_mutex);
-            } else {
-              switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) Failed to lock codec_write_mutex\n", tech_pvt->id);
+              offset += bytes_per_frame;
             }
           }
           if (jsonAudio) cJSON_Delete(jsonAudio);

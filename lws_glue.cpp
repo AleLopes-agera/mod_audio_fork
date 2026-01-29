@@ -919,7 +919,10 @@ extern "C" {
 
   switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
     CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
-    if (switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
+
+    // CORREÇÃO CRÍTICA: Usar lock (bloqueante) em vez de trylock.
+    // O FreeSWITCH TEM que esperar o buffer estar disponível, não pode pular o frame.
+    switch_mutex_lock(tech_pvt->mutex);
 
       // if flag was set to clear the buffer, do so and clear the flag
       if (tech_pvt->clear_bidirectional_audio_buffer) {
@@ -951,91 +954,40 @@ extern "C" {
       }
       else {
         switch_frame_t* rframe = switch_core_media_bug_get_write_replace_frame(bug);
-        int16_t *fp = reinterpret_cast<int16_t*>(rframe->data);
 
-        rframe->channels = 1;
-        rframe->datalen = rframe->samples * sizeof(int16_t);
+        if (rframe) {
+            int16_t *fp = reinterpret_cast<int16_t*>(rframe->data);
+            rframe->channels = 1;
+            rframe->datalen = rframe->samples * sizeof(int16_t);
 
-        int16_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
-        memset(data, 0, sizeof(data));
+            int16_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
+            memset(data, 0, sizeof(data));
 
-        int samplesToCopy = std::min(static_cast<int>(cBuffer->size()), static_cast<int>(rframe->samples));
+            int samplesToCopy = std::min(static_cast<int>(cBuffer->size()), static_cast<int>(rframe->samples));
 
-        //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "(%u) dub_speech_frame - samples to copy %u\n", tech_pvt->id, samplesToCopy); 
+            if (samplesToCopy > 0) {
+              // 1. Copia do Buffer Circular
+              std::copy_n(cBuffer->begin(), samplesToCopy, data);
+              cBuffer->erase(cBuffer->begin(), cBuffer->begin() + samplesToCopy);
 
-        bool hasMarkers = false;
-        std::deque<std::string>* pVecInventory = nullptr;
-        std::deque<std::string>* pVecInUse = nullptr;
-        std::deque<std::string>* pVecCleared = nullptr;
-        if (tech_pvt->pVecMarksInInventory && tech_pvt->pVecMarksInUse && tech_pvt->pVecMarksCleared) {
-          pVecInventory = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInInventory);
-          pVecInUse = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInUse);
-          pVecCleared = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksCleared);
-          hasMarkers = pVecInUse->size() + pVecCleared->size() >  0;
-        }
+              // 2. Substitui o áudio do frame (Overwrite/Replace)
+              // Usamos memcpy para garantir que a voz do Bot substitua o silêncio/ruído
+              memcpy(fp, data, samplesToCopy * sizeof(int16_t));
 
-        if (hasMarkers) {
-          /* discard markers and send notifications */
-          auto bufferIter = cBuffer->begin();
-          auto dataIter = data;
-          for (int i = 0; i < samplesToCopy; ++i) {
-            if (*bufferIter == AUDIO_MARKER) {
-              // Marker detected, discard it and send a notice unless it was previously cleared
-              auto * pVec = pVecCleared->size() > 0 ? pVecCleared : pVecInUse;
-              if (!pVec->empty()) {
-                auto name = pVec->front();
-                pVec->pop_front();
-
-                if (pVec == pVecInUse) {
-                  send_mark_event(tech_pvt, name.c_str());
-                  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "(%u) dub_speech_frame - Marker %s detected in playout\n",
-                    tech_pvt->id, name.c_str());
-                }
-                else {
-                  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "(%u) dub_speech_frame - Marker %s detected in playout but previously cleared\n",
-                    tech_pvt->id, name.c_str());
-                }
+              // 3. Se faltou dados (Underrun), preenche o resto com silêncio
+              if (samplesToCopy < rframe->samples) {
+                  memset(fp + samplesToCopy, 0, (rframe->samples - samplesToCopy) * sizeof(int16_t));
               }
-            } else {
-              // Copy valid audio samplewhat 
-              *dataIter = *bufferIter;
-              ++dataIter;
+
+              // 4. Efetiva a substituição no Core
+              switch_core_media_bug_set_write_replace_frame(bug, rframe);
             }
-            ++bufferIter;
-          }
-
-          // Remove the processed samples (including discarded markers) from the buffer
-          cBuffer->erase(cBuffer->begin(), cBuffer->begin() + samplesToCopy);
-
-          // Adjust the number of samples copied to the output frame
-          int validSamplesCopied = std::distance(data, dataIter);
-
-          if (validSamplesCopied > 0) {
-            vector_add(fp, data, validSamplesCopied);
-          }
         }
-        else {
-          std::copy_n(cBuffer->begin(), samplesToCopy, data);
-          cBuffer->erase(cBuffer->begin(), cBuffer->begin() + samplesToCopy);
-
-          if (samplesToCopy > 0) {
-            vector_add(fp, data, rframe->samples);
-          } else if (pVecInventory && pVecInventory->size()) {
-            // no bidirectional audio to dub but still have some mark in inventory, send them now
-            auto name = pVecInventory->front();
-            pVecInventory->pop_front();
-
-            send_mark_event(tech_pvt, name.c_str());
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "(%u) dub_speech_frame - Marker %s detected in inventory\n",
-              tech_pvt->id, name.c_str());
-          }
-        }
-        vector_normalize(fp, rframe->samples);
-
-        switch_core_media_bug_set_write_replace_frame(bug, rframe);
       }
-      switch_mutex_unlock(tech_pvt->mutex);
-    }
+
+    // Libera o mutex
+    switch_mutex_unlock(tech_pvt->mutex);
+
     return SWITCH_TRUE;
   }
 

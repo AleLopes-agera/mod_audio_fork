@@ -919,7 +919,9 @@ extern "C" {
 
   switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
     CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
-    if (switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
+
+    // MUDANÇA 1: Usar lock real, não trylock. Precisamos garantir a leitura.
+    switch_mutex_lock(tech_pvt->mutex);
 
       // if flag was set to clear the buffer, do so and clear the flag
       if (tech_pvt->clear_bidirectional_audio_buffer) {
@@ -951,6 +953,13 @@ extern "C" {
       }
       else {
         switch_frame_t* rframe = switch_core_media_bug_get_write_replace_frame(bug);
+
+        // Se não tiver frame de substituição, cria um dummy para manter o clock
+        if (!rframe) {
+            switch_mutex_unlock(tech_pvt->mutex);
+            return SWITCH_TRUE;
+        }
+
         int16_t *fp = reinterpret_cast<int16_t*>(rframe->data);
 
         rframe->channels = 1;
@@ -1011,7 +1020,13 @@ extern "C" {
           int validSamplesCopied = std::distance(data, dataIter);
 
           if (validSamplesCopied > 0) {
-            vector_add(fp, data, validSamplesCopied);
+            // MUDANÇA 2: Mixagem - Substituir áudio (TTS é prioridade)
+            memcpy(fp, data, validSamplesCopied * sizeof(int16_t));
+
+            // Preenche o resto com silêncio se faltou dados (Underrun suave)
+            if (validSamplesCopied < rframe->samples) {
+                memset(fp + validSamplesCopied, 0, (rframe->samples - validSamplesCopied) * sizeof(int16_t));
+            }
           }
         }
         else {
@@ -1019,7 +1034,13 @@ extern "C" {
           cBuffer->erase(cBuffer->begin(), cBuffer->begin() + samplesToCopy);
 
           if (samplesToCopy > 0) {
-            vector_add(fp, data, rframe->samples);
+            // MUDANÇA 2: Mixagem - Substituir áudio (TTS é prioridade)
+            memcpy(fp, data, samplesToCopy * sizeof(int16_t));
+
+            // Preenche o resto com silêncio se faltou dados (Underrun suave)
+            if (samplesToCopy < rframe->samples) {
+                memset(fp + samplesToCopy, 0, (rframe->samples - samplesToCopy) * sizeof(int16_t));
+            }
           } else if (pVecInventory && pVecInventory->size()) {
             // no bidirectional audio to dub but still have some mark in inventory, send them now
             auto name = pVecInventory->front();
@@ -1030,12 +1051,12 @@ extern "C" {
               tech_pvt->id, name.c_str());
           }
         }
-        vector_normalize(fp, rframe->samples);
+        // vector_normalize(fp, rframe->samples); // Removed because we are replacing, not mixing
 
         switch_core_media_bug_set_write_replace_frame(bug, rframe);
       }
       switch_mutex_unlock(tech_pvt->mutex);
-    }
+
     return SWITCH_TRUE;
   }
 

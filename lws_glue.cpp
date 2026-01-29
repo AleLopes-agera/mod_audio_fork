@@ -235,8 +235,8 @@ namespace {
             cJSON* jsonSR = cJSON_GetObjectItem(jsonData, "sampleRate");
             if (jsonSR && jsonSR->valueint) sampleRate = jsonSR->valueint;
 
-            // Access the buffer
-            if (nullptr != tech_pvt->mutex && switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
+            // Access the buffer - Use blocking lock to ensure data integrity
+            if (nullptr != tech_pvt->mutex && switch_mutex_lock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
                 CircularBuffer_t *playoutBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
                 try {
                     // Convert raw audio to int16_t vector
@@ -250,13 +250,67 @@ namespace {
                     }
                     // Push the data into the buffer.
                     playoutBuffer->insert(playoutBuffer->end(), pAudio, pAudio + numSamples);
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) Buffered %zu bytes of TTS audio. Buffer size: %zu\n", tech_pvt->id, decodedLen, playoutBuffer->size());
+
+                    // switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%u) Buffered %zu bytes of TTS audio. Buffer size: %zu\n", tech_pvt->id, decodedLen, playoutBuffer->size());
 
                 } catch (const std::exception& e) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error buffering TTS audio: %s\n", e.what());
                 } catch (...) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error buffering TTS audio\n");
                 }
+
+                // HYBRID LOGIC: Drain buffer immediately in 20ms chunks to session
+                // This acts as a jitter buffer but pushes to FS immediately
+
+                // Initialize Codec if needed (Re-enabled for direct write)
+                if (!tech_pvt->raw_write_codec_initialized) {
+                  if (switch_core_codec_init(&tech_pvt->raw_write_codec,
+                                "L16",
+                                NULL,
+                                NULL,
+                                sampleRate,
+                                20,
+                                1,
+                                SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE,
+                                NULL, switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
+                    tech_pvt->raw_write_codec_initialized = 1;
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) Raw write codec initialized at %dHz\n", tech_pvt->id, sampleRate);
+                  } else {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) Failed to initialize raw write codec\n", tech_pvt->id);
+                  }
+                }
+
+                if (tech_pvt->raw_write_codec_initialized) {
+                    int frame_duration_ms = 20;
+                    int samples_per_frame = (sampleRate * frame_duration_ms / 1000);
+
+                    // Log first frame only
+                    // switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) STREAM DEBUG: Draining buffer to session...\n", tech_pvt->id);
+
+                    while (playoutBuffer->size() >= (size_t)samples_per_frame) {
+                        int16_t samples[samples_per_frame];
+                        std::copy_n(playoutBuffer->begin(), samples_per_frame, samples);
+                        playoutBuffer->erase(playoutBuffer->begin(), playoutBuffer->begin() + samples_per_frame);
+
+                        switch_frame_t frame;
+                        memset(&frame, 0, sizeof(frame));
+                        frame.codec = &tech_pvt->raw_write_codec;
+                        frame.data = samples;
+                        frame.datalen = samples_per_frame * sizeof(int16_t);
+                        frame.samples = samples_per_frame;
+                        frame.rate = sampleRate;
+                        frame.channels = 1;
+                        frame.timestamp = tech_pvt->write_ts;
+                        tech_pvt->write_ts += frame.samples;
+
+                        switch_status_t status = switch_core_session_write_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0);
+                        if (status != SWITCH_STATUS_SUCCESS) {
+                             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) STREAM ERROR: Write Frame failed! Status: %d\n", tech_pvt->id, status);
+                             break;
+                        }
+                    }
+                }
+
                 switch_mutex_unlock(tech_pvt->mutex);
             } else {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) Failed to lock mutex for buffering TTS\n", tech_pvt->id);

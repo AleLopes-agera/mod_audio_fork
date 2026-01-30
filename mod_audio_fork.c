@@ -272,9 +272,7 @@ SWITCH_STANDARD_API(fork_function)
 					bidirectional_audio_stream = !strcmp(argv[8], "true") ? 1 : 0;
 					bidirectional_audio_sample_rate = atoi(argv[9]);
 
-					if (bidirectional_audio_enable &&
-						bidirectional_audio_stream &&
-						bidirectional_audio_sample_rate) {
+					if (bidirectional_audio_enable) {
 						flags |= SMBF_WRITE_REPLACE ;
 					}
 				} else if( argc > 6 ) {

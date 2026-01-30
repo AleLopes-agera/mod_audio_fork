@@ -467,7 +467,7 @@ namespace {
       tech_pvt->downscale_factor = bidirectional_audio_sample_rate / sampling;
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "downscale_factor is %d\n", tech_pvt->downscale_factor);
     }
-    tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor * 4; // min 80ms prebuffer
+    tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor * 6; // min 120ms prebuffer
     tech_pvt->streamingPreBuffer = (void *) new CircularBuffer_t(8192);
     tech_pvt->pVecMarksInInventory = nullptr;
     tech_pvt->pVecMarksInUse = nullptr;
@@ -921,10 +921,20 @@ extern "C" {
 switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
     if (!tech_pvt) return SWITCH_TRUE;
 
+    static uint32_t call_count = 0;
+    static uint32_t underrun_count = 0;
+    call_count++;
+
     // Usar lock BLOQUEANTE - crítico para sincronização
     switch_mutex_lock(tech_pvt->mutex);
 
     CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
+
+    if (call_count % 50 == 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                         "(%u) SISTEMA ATIVO #%u: Buffer=%zu samples, Underruns=%u\n",
+                         tech_pvt->id, call_count, cBuffer->size(), underrun_count);
+    }
 
     // Lógica de clear buffer
     if (tech_pvt->clear_bidirectional_audio_buffer) {
@@ -999,6 +1009,7 @@ switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
                 switch_core_media_bug_set_write_replace_frame(bug, rframe);
 
             } else {
+                underrun_count++;
                 // Buffer vazio: enviar silêncio para evitar picotes
                 memset(fp, 0, samples_needed * sizeof(int16_t));
                 rframe->channels = 1;

@@ -112,8 +112,7 @@ namespace {
 
     //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Prebuffered data samples %u is above threshold %u, prepare to playout.\n", cBuffer->size(), tech_pvt->streamingPreBufSize);
 
-    // after initial pre-buffering, rachet down the threshold to 40ms
-    tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor * 2;
+    // tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor * 2; // Removed dynamic resizing
 
     // Check for downsampling factor
     size_t downsample_factor = tech_pvt->downscale_factor;
@@ -163,7 +162,7 @@ namespace {
       return SWITCH_STATUS_FALSE;
     }
 
-    if (nullptr != tech_pvt->mutex && switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
+    if (nullptr != tech_pvt->mutex && switch_mutex_lock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
       CircularBuffer_t *playoutBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
 
       try {
@@ -257,58 +256,6 @@ namespace {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error buffering TTS audio: %s\n", e.what());
                 } catch (...) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error buffering TTS audio\n");
-                }
-
-                // HYBRID LOGIC: Drain buffer immediately in 20ms chunks to session
-                // This acts as a jitter buffer but pushes to FS immediately
-
-                // Initialize Codec if needed (Re-enabled for direct write)
-                if (!tech_pvt->raw_write_codec_initialized) {
-                  if (switch_core_codec_init(&tech_pvt->raw_write_codec,
-                                "L16",
-                                NULL,
-                                NULL,
-                                sampleRate,
-                                20,
-                                1,
-                                SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE,
-                                NULL, switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
-                    tech_pvt->raw_write_codec_initialized = 1;
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) Raw write codec initialized at %dHz\n", tech_pvt->id, sampleRate);
-                  } else {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) Failed to initialize raw write codec\n", tech_pvt->id);
-                  }
-                }
-
-                if (tech_pvt->raw_write_codec_initialized) {
-                    int frame_duration_ms = 20;
-                    int samples_per_frame = (sampleRate * frame_duration_ms / 1000);
-
-                    // Log first frame only
-                    // switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_CRIT, "(%u) STREAM DEBUG: Draining buffer to session...\n", tech_pvt->id);
-
-                    while (playoutBuffer->size() >= (size_t)samples_per_frame) {
-                        int16_t samples[samples_per_frame];
-                        std::copy_n(playoutBuffer->begin(), samples_per_frame, samples);
-                        playoutBuffer->erase(playoutBuffer->begin(), playoutBuffer->begin() + samples_per_frame);
-
-                        switch_frame_t frame;
-                        memset(&frame, 0, sizeof(frame));
-                        frame.codec = &tech_pvt->raw_write_codec;
-                        frame.data = samples;
-                        frame.datalen = samples_per_frame * sizeof(int16_t);
-                        frame.samples = samples_per_frame;
-                        frame.rate = sampleRate;
-                        frame.channels = 1;
-                        frame.timestamp = tech_pvt->write_ts;
-                        tech_pvt->write_ts += frame.samples;
-
-                        switch_status_t status = switch_core_session_write_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0);
-                        if (status != SWITCH_STATUS_SUCCESS) {
-                             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) STREAM ERROR: Write Frame failed! Status: %d\n", tech_pvt->id, status);
-                             break;
-                        }
-                    }
                 }
 
                 switch_mutex_unlock(tech_pvt->mutex);
@@ -520,7 +467,7 @@ namespace {
       tech_pvt->downscale_factor = bidirectional_audio_sample_rate / sampling;
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "downscale_factor is %d\n", tech_pvt->downscale_factor);
     }
-    tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor * 4; // min 80ms prebuffer
+    tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor * 6; // min 120ms prebuffer
     tech_pvt->streamingPreBuffer = (void *) new CircularBuffer_t(8192);
     tech_pvt->pVecMarksInInventory = nullptr;
     tech_pvt->pVecMarksInUse = nullptr;
@@ -971,79 +918,110 @@ extern "C" {
     return SWITCH_TRUE;
   }
 
-  switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
-    CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
+switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
+    if (!tech_pvt) return SWITCH_TRUE;
 
-    // CORREÇÃO CRÍTICA: Usar lock (bloqueante) em vez de trylock.
-    // O FreeSWITCH TEM que esperar o buffer estar disponível, não pode pular o frame.
+    static uint32_t call_count = 0;
+    static uint32_t underrun_count = 0;
+    call_count++;
+
+    // Usar lock BLOQUEANTE - crítico para sincronização
     switch_mutex_lock(tech_pvt->mutex);
 
-      // if flag was set to clear the buffer, do so and clear the flag
-      if (tech_pvt->clear_bidirectional_audio_buffer) {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "(%u) dub_speech_frame - clearing buffer\n", tech_pvt->id); 
+    CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
+
+    if (call_count % 50 == 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                         "(%u) SISTEMA ATIVO #%u: Buffer=%zu samples, Underruns=%u\n",
+                         tech_pvt->id, call_count, cBuffer->size(), underrun_count);
+    }
+
+    // Lógica de clear buffer
+    if (tech_pvt->clear_bidirectional_audio_buffer) {
         cBuffer->clear();
         tech_pvt->clear_bidirectional_audio_buffer = false;
 
-        // send "mark" event for any queued markers
+        // Processar marcadores cleared (sua lógica atual)
         if (nullptr != tech_pvt->pVecMarksInInventory) {
-          std::deque<std::string>* pVecMarksInInventory = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInInventory);
-          std::deque<std::string>* pVecMarksInUse = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInUse);
-          if (pVecMarksInInventory->size() + pVecMarksInUse->size() > 0) {
-            std::deque<std::string> vec = *pVecMarksInUse;
-            vec.insert(vec.end(), pVecMarksInInventory->begin(), pVecMarksInInventory->end());
-            for (auto it = vec.begin(); it != vec.end(); ++it) {
-              switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "(%u) dub_speech_frame - Marker %s cleared\n",
-                  tech_pvt->id, it->c_str());
-              send_mark_event(tech_pvt, it->c_str(), true);
-            }
-
-            // put the "in-use" ones into the "cleared" queue so we dont notify again when they eventually come through
+            std::deque<std::string>* pVecMarksInInventory = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInInventory);
+            std::deque<std::string>* pVecMarksInUse = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInUse);
             std::deque<std::string>* pVecMarksCleared = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksCleared);
-            pVecMarksCleared->insert(pVecMarksCleared->end(), pVecMarksInUse->begin(), pVecMarksInUse->end());
 
-            pVecMarksInUse->clear();
-            pVecMarksInInventory->clear();
-          }
+            if (pVecMarksInInventory->size() + pVecMarksInUse->size() > 0) {
+                std::deque<std::string> vec = *pVecMarksInUse;
+                vec.insert(vec.end(), pVecMarksInInventory->begin(), pVecMarksInInventory->end());
+
+                for (auto it = vec.begin(); it != vec.end(); ++it) {
+                    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                                     "(%u) Marker %s cleared\n", tech_pvt->id, it->c_str());
+                    send_mark_event(tech_pvt, it->c_str(), true);
+                }
+
+                pVecMarksCleared->insert(pVecMarksCleared->end(), pVecMarksInUse->begin(), pVecMarksInUse->end());
+                pVecMarksInUse->clear();
+                pVecMarksInInventory->clear();
+            }
         }
-      }
-      else {
+    } else {
+        // Obter frame do FreeSWITCH
         switch_frame_t* rframe = switch_core_media_bug_get_write_replace_frame(bug);
 
-        if (rframe) {
+        if (rframe && rframe->datalen > 0) {
             int16_t *fp = reinterpret_cast<int16_t*>(rframe->data);
-            rframe->channels = 1;
-            rframe->datalen = rframe->samples * sizeof(int16_t);
+            int samples_needed = rframe->samples;
 
-            int16_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
-            memset(data, 0, sizeof(data));
-
-            int samplesToCopy = std::min(static_cast<int>(cBuffer->size()), static_cast<int>(rframe->samples));
+            // Verificar dados disponíveis
+            int samplesToCopy = std::min(static_cast<int>(cBuffer->size()), samples_needed);
 
             if (samplesToCopy > 0) {
-              // 1. Copia do Buffer Circular
-              std::copy_n(cBuffer->begin(), samplesToCopy, data);
-              cBuffer->erase(cBuffer->begin(), cBuffer->begin() + samplesToCopy);
+                // Preparar dados com silêncio
+                std::vector<int16_t> data(samples_needed, 0);
+                std::copy_n(cBuffer->begin(), samplesToCopy, data.begin());
+                cBuffer->erase(cBuffer->begin(), cBuffer->begin() + samplesToCopy);
 
-              // 2. Substitui o áudio do frame (Overwrite/Replace)
-              // Usamos memcpy para garantir que a voz do Bot substitua o silêncio/ruído
-              memcpy(fp, data, samplesToCopy * sizeof(int16_t));
+                // Processar marcadores
+                for (int i = 0; i < samplesToCopy; i++) {
+                    if ((uint16_t)data[i] == AUDIO_MARKER && nullptr != tech_pvt->pVecMarksInUse) {
+                        std::deque<std::string>* pVecMarksInUse = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInUse);
+                        std::deque<std::string>* pVecMarksCleared = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksCleared);
 
-              // 3. Se faltou dados (Underrun), preenche o resto com silêncio
-              if (samplesToCopy < rframe->samples) {
-                  memset(fp + samplesToCopy, 0, (rframe->samples - samplesToCopy) * sizeof(int16_t));
-              }
+                        if (!pVecMarksInUse->empty()) {
+                            std::string mark = pVecMarksInUse->front();
+                            pVecMarksInUse->pop_front();
 
-              // 4. Efetiva a substituição no Core
-              switch_core_media_bug_set_write_replace_frame(bug, rframe);
+                            auto it = std::find(pVecMarksCleared->begin(), pVecMarksCleared->end(), mark);
+                            if (it == pVecMarksCleared->end()) {
+                                send_mark_event(tech_pvt, mark.c_str(), false);
+                            } else {
+                                pVecMarksCleared->erase(it);
+                            }
+                        }
+                        data[i] = 0; // Substituir marcador por silêncio
+                    }
+                }
+
+                // SUBSTITUIR completamente o frame original
+                memcpy(fp, data.data(), samples_needed * sizeof(int16_t));
+                rframe->channels = 1;
+                rframe->datalen = samples_needed * sizeof(int16_t);
+
+                // Aplicar a substituição
+                switch_core_media_bug_set_write_replace_frame(bug, rframe);
+
+            } else {
+                underrun_count++;
+                // Buffer vazio: enviar silêncio para evitar picotes
+                memset(fp, 0, samples_needed * sizeof(int16_t));
+                rframe->channels = 1;
+                rframe->datalen = samples_needed * sizeof(int16_t);
+                switch_core_media_bug_set_write_replace_frame(bug, rframe);
             }
         }
-      }
+    }
 
-    // Libera o mutex
     switch_mutex_unlock(tech_pvt->mutex);
-
     return SWITCH_TRUE;
-  }
+}
 
   switch_status_t fork_session_stop_play(switch_core_session_t *session, char *bugname) {
     switch_channel_t *channel = switch_core_session_get_channel(session);
